@@ -137,14 +137,14 @@
 
 ## 10) 슬래시 명령 사용법
 
-`doPost` 엔드포인트는 Slack Slash Command를 지원합니다.
+`doPost` 엔드포인트는 Slack Slash Command(`/cdv`)를 지원합니다.
 
 ### 10.1 명령 텍스트
 
 - `예정` : 예정 스레드 발송 실행
 - `완료` : 완료 목록 스레드 발송 실행
 - `취소` : 취소 목록 스레드 발송 실행
-- `큐비우기` : 액션 큐 비우기
+- `init` : 액션 큐 비우기(초기화)
 - `help` 또는 `도움말` : 사용 가능한 명령 안내
 
 기간 지정(선택):
@@ -170,7 +170,7 @@
 
 1. Slack App 관리 페이지 접속
 2. 좌측 `Slash Commands` 메뉴에서 `Create New Command` 선택
-3. Command 입력 (예: `/kfg`)
+3. Command 입력 (예: `/cdv`)
 4. Request URL에 Apps Script Web App URL 입력
 5. Description/Usage Hint 입력 후 저장
 6. Slack 워크스페이스에 앱 재설치(Install/ Reinstall) 수행

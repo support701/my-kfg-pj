@@ -457,7 +457,7 @@ function parseSlashCommandText_(text) {
   if (["취소", "cancelled", "cancel", "x"].indexOf(command) >= 0) {
     return { ok: true, type: "cancelled", period: period.value };
   }
-  if (["큐비우기", "clear-queue", "clear_queue"].indexOf(command) >= 0) {
+  if (["init", "initialize"].indexOf(command) >= 0) {
     return { ok: true, type: "clear_queue" };
   }
 
@@ -476,7 +476,7 @@ function buildSlashHelpText_(prefix) {
     "- 취소 최근30일",
     "- 예정 전체",
     "- 완료 2026-04-01~2026-04-30",
-    "- 큐비우기"
+    "- init"
   ];
   return help.join("\n");
 }
