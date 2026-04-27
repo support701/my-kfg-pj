@@ -39,6 +39,7 @@
 
 - `setupSlackActionQueueTrigger()` : 1분 주기 큐 워커
 - `setupDailyHealthCheckTrigger()` : 매일 오전 9시 상태 리포트
+- `setupDailyDigestTrigger()` : 매일 오전 9시 5분 DM 요약 1회 발송
 
 중복 생성 방지 로직이 있으므로 여러 번 실행해도 안전합니다.
 
@@ -53,9 +54,9 @@
 
 권장 구현:
 
-- `dailyDigestJob()` 함수 추가
-- Properties에 `LAST_DM_SENT_DATE_YYYYMMDD` 기록
-- 이미 발송된 날짜면 skip, 아니면 발송 후 기록
+- `dailyDigestJob()` 구현 완료
+- Properties의 `DAILY_DIGEST_SENT_DATE`로 일일 중복 발송 방지
+- 수신자는 `DAILY_DM_USER_IDS`(쉼표 구분 Slack User ID 목록) 사용
 
 확장 옵션:
 
@@ -115,7 +116,69 @@
 ## 7) 추천 다음 작업 순서
 
 1. `setupOperationsTriggers()` 1회 실행
-2. `dailyDigestJob()`(1회 자동 DM) 구현
+2. Script Properties에 `DAILY_DM_USER_IDS` 설정
 3. Slack 명령 기반 DM(`전체/7일/30일/직접입력`) 구현
 4. 완료건 전용 DM 템플릿 분리
 5. 운영 대시보드 시트(최근 실패/큐 길이) 추가
+
+## 8) 필수 설정 값
+
+- `SLACK_BOT_TOKEN` : Slack Bot OAuth Token
+- `SLACK_CHANNEL_ID` : 기본 발송 채널 ID
+- `DAILY_DM_USER_IDS` : (선택) 일일 DM 수신자 Slack User ID 목록(예: `U0123,U0456`)
+  - 미설정 시 `SLACK_CHANNEL_ID` 채널로 자동 발송
+
+## 9) 현재 안정 설정값(권장)
+
+- `MAX_THREAD_MESSAGES_PER_RUN=10` (초기 안정 운영값, 필요 시 점진 상향)
+- `DAILY_DM_USER_IDS` 미설정 시 채널 자동 발송 방식 유지
+- 트리거는 `setupOperationsTriggers()`로 일괄 관리
+- 버튼 상태변경은 동기 즉시 처리 경로 유지(큐는 보조/운영용)
+
+## 10) 슬래시 명령 사용법
+
+`doPost` 엔드포인트는 Slack Slash Command를 지원합니다.
+
+### 10.1 명령 텍스트
+
+- `예정` : 예정 스레드 발송 실행
+- `완료` : 완료 목록 스레드 발송 실행
+- `취소` : 취소 목록 스레드 발송 실행
+- `큐비우기` : 액션 큐 비우기
+- `help` 또는 `도움말` : 사용 가능한 명령 안내
+
+기간 지정(선택):
+
+- `전체`
+- `최근7일`
+- `최근30일` (`최근한달` 가능)
+- `YYYY-MM-DD~YYYY-MM-DD`
+
+예시:
+
+- `예정 전체`
+- `완료 최근7일`
+- `취소 2026-04-01~2026-04-30`
+
+실행 방식:
+
+- `/cd`는 즉시 접수 응답 후 백그라운드 실행
+- 대상건수가 작으면(기본 5건 이하) 즉시 실행
+- 완료 후 성공/실패 건수를 에페메랄로 재안내
+
+### 10.2 Slack 설정 방법
+
+1. Slack App 관리 페이지 접속
+2. 좌측 `Slash Commands` 메뉴에서 `Create New Command` 선택
+3. Command 입력 (예: `/kfg`)
+4. Request URL에 Apps Script Web App URL 입력
+5. Description/Usage Hint 입력 후 저장
+6. Slack 워크스페이스에 앱 재설치(Install/ Reinstall) 수행
+
+### 10.3 Apps Script 배포 체크
+
+- `배포 > 새 배포 > 웹 앱`
+- 실행 사용자: `나`
+- 액세스 권한: `모든 사용자`(또는 Slack 호출 가능한 범위)
+- 새 배포 후 나온 웹앱 URL을 Slash Command의 Request URL에 반영
+- 코드 수정 시 재배포 후 URL/버전 갱신 여부 확인

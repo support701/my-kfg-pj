@@ -5,11 +5,38 @@ const SLACK_CHANNEL_ID = SCRIPT_PROPS.getProperty('SLACK_CHANNEL_ID') || 'C0AV00
 /**
  * 1. 지출 알림 전송 (Block Kit 적용)
  */
-function sendDailyReminders(mode = 'pending') {
+function sendDailyReminders(mode = 'pending', opts) {
+  const options = opts || {};
+  const period = options.period || { type: "default" };
+  const stats = {
+    mode: mode,
+    ok: false,
+    skipped: false,
+    reason: "",
+    parentSent: false,
+    parentTs: "",
+    candidateCount: 0,
+    sentCount: 0,
+    failedCount: 0,
+    quotaHit: false
+  };
+
+  const runLock = LockService.getScriptLock();
+  if (!runLock.tryLock(3000)) {
+    Logger.log(`[sendDailyReminders] 다른 실행이 진행 중이라 스킵: mode=${mode}`);
+    stats.skipped = true;
+    stats.reason = "locked";
+    return stats;
+  }
+  try {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName('원장DB');
   const lastRow = sheet.getLastRow();
-  if (lastRow < 10) return;
+  if (lastRow < 10) {
+    stats.ok = true;
+    stats.reason = "no_data";
+    return stats;
+  }
 
   const data = sheet.getRange(1, 1, lastRow, 19).getValues();
   const today = new Date();
@@ -24,8 +51,12 @@ function sendDailyReminders(mode = 'pending') {
     const status = String(row[11] || "").trim();
     if (mode === 'pending') {
       if (['완료', '보류', '취소'].includes(status)) continue;
-    } else {
+    } else if (mode === 'completed') {
       if (status !== '완료') continue;
+    } else if (mode === 'cancelled') {
+      if (status !== '취소') continue;
+    } else {
+      continue;
     }
 
     const dueDateRaw = row[6];
@@ -33,10 +64,10 @@ function sendDailyReminders(mode = 'pending') {
     const dueDate = new Date(dueDateRaw);
     dueDate.setHours(0, 0, 0, 0);
     const diffDays = Math.round((dueDate - today) / (1000 * 60 * 60 * 24));
-
-    if (mode === 'completed' || targetDays.includes(diffDays)) {
+    const referenceDate = getReferenceDateForMode_(row, mode, dueDate);
+    if (shouldIncludeByPeriod_(mode, diffDays, referenceDate, period, targetDays, today)) {
       const dayLabels = ['일', '월', '화', '수', '목', '금', '토'];
-      const dateStr = `${Utilities.formatDate(dueDate, "GMT+9", "yyyy-MM-dd")}(${dayLabels[dueDate.getDay()]})`;
+      const dateStr = `${Utilities.formatDate(referenceDate, "GMT+9", "yyyy-MM-dd")}(${dayLabels[referenceDate.getDay()]})`;
       const desc = String(row[5] || "내역 없음").trim();
       if (!groups[dateStr]) groups[dateStr] = { items: {}, isUrgent: (diffDays <= 7) };
       if (!groups[dateStr].items[desc]) groups[dateStr].items[desc] = [];
@@ -46,31 +77,173 @@ function sendDailyReminders(mode = 'pending') {
   }
 
   const sortedDates = Object.keys(groups).sort();
-  if (sortedDates.length === 0) return;
+  if (sortedDates.length === 0) {
+    stats.ok = true;
+    stats.reason = "no_target_items";
+    return stats;
+  }
 
-  const title = mode === 'pending' ? `*[지출 집행 예정 요약]*` : `*[최근 완료 내역]*`;
+  sortedDates.forEach(date => {
+    const descGroups = groups[date].items;
+    Object.keys(descGroups).forEach(desc => {
+      stats.candidateCount += descGroups[desc].length;
+    });
+  });
+
+  const title = mode === 'pending' ? `*[지출 집행 예정 요약]*` : (mode === 'completed' ? `*[최근 완료 내역]*` : `*[최근 취소 내역]*`);
   const summaryLines = buildParentSummaryLines(groups, mode, grandTotal);
   const parentMsg = `${title}\n\`\`\`\n${summaryLines}\n\`\`\`\n※ 상세내역은 아래 스래드를 확인하세요`;
   
-  const parentTs = postToSlack(parentMsg);
+  let parentTs = null;
+  try {
+    parentTs = postToSlack(parentMsg);
+    stats.parentSent = true;
+    stats.parentTs = String(parentTs || "");
+  } catch (e) {
+    Logger.log(`[sendDailyReminders] parent message 전송 실패: ${e}`);
+    stats.reason = "parent_post_failed";
+    return stats;
+  }
   
   if (parentTs) {
     let itemIndex = 1;
+    const configuredLimit = Number(SCRIPT_PROPS.getProperty("MAX_THREAD_MESSAGES_PER_RUN") || 25);
+    const maxThreadMessagesPerRun = (!isNaN(configuredLimit) && configuredLimit > 0) ? Math.floor(configuredLimit) : 25;
+    let sentCount = 0;
+    let quotaHit = false;
+    let failedCount = 0;
     sortedDates.forEach(date => {
+      if (quotaHit) return;
       const descGroups = groups[date].items;
       Object.keys(descGroups).forEach(desc => {
+        if (quotaHit) return;
         descGroups[desc].forEach(item => {
-          const blocks = buildDetailBlocks(item.data, (mode === 'completed'), "", itemIndex++, mode === 'completed' ? '완료' : '예정');
+          if (quotaHit) return;
+          if (sentCount >= maxThreadMessagesPerRun) {
+            quotaHit = true;
+            Logger.log(`[sendDailyReminders] 실행당 상한 도달: ${maxThreadMessagesPerRun}`);
+            return;
+          }
+          const initialStatus = mode === 'completed' ? '완료' : (mode === 'cancelled' ? '취소' : '예정');
+          const blocks = buildDetailBlocks(item.data, (mode === 'completed'), "", itemIndex++, initialStatus);
           try {
             const childTs = postToSlackBlocks(blocks, parentTs);
-            if (childTs) sheet.getRange(item.rowNum, 17).setValue("'" + childTs);
+            if (childTs) {
+              sheet.getRange(item.rowNum, 17).setValue("'" + childTs);
+              registerApprovalThreadTs_(String(item.data[2] || "").trim(), childTs);
+              sentCount += 1;
+            } else {
+              quotaHit = true;
+            }
           } catch (err) {
             Logger.log(`[Slack 전송 실패] row=${item.rowNum}, error=${err}`);
+            const errText = String(err || "");
+            if (errText.indexOf("Bandwidth quota exceeded") >= 0) {
+              quotaHit = true;
+            } else {
+              // 블록 전송 실패 시 텍스트 전송으로 1회 폴백
+              try {
+                const fallbackText = buildDetailFallbackText_(item.data, itemIndex - 1, mode === 'completed' ? '완료' : '예정');
+                const fallbackTs = postToSlack(fallbackText, parentTs);
+                if (fallbackTs) {
+                  sheet.getRange(item.rowNum, 17).setValue("'" + fallbackTs);
+                  registerApprovalThreadTs_(String(item.data[2] || "").trim(), fallbackTs);
+                  sentCount += 1;
+                } else {
+                  failedCount += 1;
+                }
+              } catch (fallbackErr) {
+                failedCount += 1;
+                Logger.log(`[Slack 폴백 전송 실패] row=${item.rowNum}, error=${fallbackErr}`);
+              }
+            }
           }
+          Utilities.sleep(120); // 짧은 간격으로 burst 전송 완화
         });
       });
     });
+
+    if (failedCount > 0) {
+      try {
+        postToSlack(`※ 일부 스레드 전송 실패: ${failedCount}건 (로그 확인 필요)`, parentTs);
+      } catch (e) {
+        Logger.log(`[sendDailyReminders] 실패 요약 알림 전송 실패: ${e}`);
+      }
+    }
+    stats.sentCount = sentCount;
+    stats.failedCount = failedCount;
+    stats.quotaHit = quotaHit;
+    stats.ok = true;
+    stats.reason = quotaHit ? "quota_or_limit_stop" : "done";
   }
+  return stats;
+  } finally {
+    runLock.releaseLock();
+  }
+}
+
+/**
+ * 수동 실행용: 지출 예정 스레드 발송
+ */
+function runPendingRemindersNow() {
+  return sendDailyReminders("pending");
+}
+
+/**
+ * 수동 실행용: 완료 목록 스레드 발송
+ */
+function runCompletedRemindersNow() {
+  return sendDailyReminders("completed");
+}
+
+function runCancelledRemindersNow() {
+  return sendDailyReminders("cancelled");
+}
+
+/**
+ * 수동 실행용: 결재번호 기준 상태 변경
+ * - approvalNo: 원장DB C열 결재번호
+ * - targetStatus: "완료" | "취소" | "예정"
+ * - actorName: 처리자명(선택)
+ */
+function changeStatusByApprovalNo(approvalNo, targetStatus, actorName) {
+  const status = String(targetStatus || "").trim();
+  if (["완료", "취소", "예정"].indexOf(status) < 0) {
+    throw new Error(`지원하지 않는 상태값: ${targetStatus}`);
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("원장DB");
+  const rowNum = findRowByApprovalNo_(sheet, approvalNo);
+  if (!rowNum) {
+    throw new Error(`결재번호를 찾지 못했습니다: ${approvalNo}`);
+  }
+
+  const ts = normalizeTs_(sheet.getRange(rowNum, 17).getValue()); // Q열 thread ts
+  const displayName = String(actorName || "수동처리").trim();
+
+  // 스레드 ts가 있으면 기존 동기 처리 로직 재사용(DB+메시지 동시 변경)
+  if (ts) {
+    return handleStatusUpdate(ts, status, "", displayName, null, 2, true, String(approvalNo || "").trim());
+  }
+
+  // 스레드가 없는 경우 DB 상태만 갱신
+  const now = new Date();
+  const currentStatus = String(sheet.getRange(rowNum, 12).getValue() || "").trim();
+  if (status === "완료") {
+    sheet.getRange(rowNum, 12).setValue("완료");
+    sheet.getRange(rowNum, 13).setValue(now);
+    sheet.getRange(rowNum, 14).setValue(displayName);
+  } else {
+    sheet.getRange(rowNum, 12).setValue(status);
+    sheet.getRange(rowNum, 18).setValue(displayName);
+    sheet.getRange(rowNum, 19).setValue(now);
+    if (status === "예정" && currentStatus === "완료") {
+      sheet.getRange(rowNum, 13).clearContent();
+      sheet.getRange(rowNum, 14).clearContent();
+    }
+  }
+  return true;
 }
 
 /**
@@ -103,23 +276,41 @@ function buildDetailBlocks(row, isComplete, userName, index, currentStatus) {
     const cancelTitle = `${index || "-"} ${itemTitle}_${target}_${amount}_${approvalNo}`;
     mainText = `\n*\`${cancelTitle}\`*\n> ⛔ 취소 | ${handlerName} | ${cancelledAt}`;
   } else {
-    const pendingTitleLine = `${prefix}${itemTitle} | \`${approvalNo}\``;
+    const pendingTitleLine = `*${prefix}${itemTitle}* | *\`${approvalNo}\`*`;
     mainText = `\n${pendingTitleLine}\n${detailCodeBlock}`;
   }
 
-  // 버튼 섹션 추가
+  // 버튼 섹션 추가 (상태별 노출 제어)
+  const actionButtons = getActionButtonsForStatus_(currentStatus, index);
   const blocks = [
     { "type": "section", "text": { "type": "mrkdwn", "text": mainText } },
     {
       "type": "actions",
-      "elements": [
-        { "type": "button", "text": { "type": "plain_text", "text": "완료" }, "style": "primary", "action_id": "status_done", "value": String(index || "") },
-        { "type": "button", "text": { "type": "plain_text", "text": "취소" }, "style": "danger", "action_id": "status_cancel", "value": String(index || "") },
-        { "type": "button", "text": { "type": "plain_text", "text": "대기전환" }, "action_id": "status_pending", "value": String(index || "") }
-      ]
+      "elements": actionButtons
     }
   ];
   return blocks;
+}
+
+function getActionButtonsForStatus_(status, index) {
+  const value = String(index || "");
+  const normalized = String(status || "").trim();
+  if (normalized === "완료") {
+    return [
+      { "type": "button", "text": { "type": "plain_text", "text": "취소" }, "style": "danger", "action_id": "status_cancel", "value": value },
+      { "type": "button", "text": { "type": "plain_text", "text": "대기전환" }, "action_id": "status_pending", "value": value }
+    ];
+  }
+  if (normalized === "취소") {
+    return [
+      { "type": "button", "text": { "type": "plain_text", "text": "완료" }, "style": "primary", "action_id": "status_done", "value": value },
+      { "type": "button", "text": { "type": "plain_text", "text": "대기전환" }, "action_id": "status_pending", "value": value }
+    ];
+  }
+  return [
+    { "type": "button", "text": { "type": "plain_text", "text": "완료" }, "style": "primary", "action_id": "status_done", "value": value },
+    { "type": "button", "text": { "type": "plain_text", "text": "취소" }, "style": "danger", "action_id": "status_cancel", "value": value }
+  ];
 }
 
 /**
@@ -127,6 +318,11 @@ function buildDetailBlocks(row, isComplete, userName, index, currentStatus) {
  */
 function doPost(e) {
   if (!e || !e.postData) return;
+  // Slash Command 처리 (application/x-www-form-urlencoded)
+  if (e.parameter && e.parameter.command) {
+    return handleSlashCommand_(e.parameter);
+  }
+
   const payload = e.parameter.payload ? JSON.parse(e.parameter.payload) : JSON.parse(e.postData.contents);
   
   // URL 검증용
@@ -140,13 +336,25 @@ function doPost(e) {
     const userId = payload.user.id;
     const clickedUserName = payload.user && payload.user.name ? payload.user.name : userId;
     const displayIndex = extractDisplayIndex(action, payload.message && payload.message.blocks);
+    const fallbackApprovalNo = extractApprovalNoFromBlocks_(payload.message && payload.message.blocks);
 
     let targetStatus = "";
     if (actionId === "status_done") targetStatus = "완료";
     else if (actionId === "status_cancel") targetStatus = "취소";
     else if (actionId === "status_pending") targetStatus = "예정";
 
-    if (targetStatus) enqueueSlackStatusAction(ts, targetStatus, userId, clickedUserName, displayIndex);
+    if (targetStatus) {
+      // 롤백: 구조 분리 이전처럼 버튼 클릭 시 즉시 동기 처리
+      let handled = false;
+      try {
+        handled = handleStatusUpdate(ts, targetStatus, userId, clickedUserName, displayIndex, 2, true, fallbackApprovalNo);
+      } catch (e) {
+        Logger.log(`[doPost Immediate Failed] ts=${ts}, status=${targetStatus}, error=${e}`);
+      }
+      if (!handled) {
+        Logger.log(`[doPost NotHandled] ts=${ts}, status=${targetStatus}, approvalNo=${fallbackApprovalNo}`);
+      }
+    }
     return ContentService.createTextOutput("");
   }
   
@@ -154,47 +362,426 @@ function doPost(e) {
   if (payload.event && payload.event.type === "reaction_added") {
     const event = payload.event;
     if (event.reaction === "white_check_mark") {
-      enqueueSlackStatusAction(event.item.ts, "완료", event.user, event.user, null);
+      handleStatusUpdate(event.item.ts, "완료", event.user, event.user, null, 2, true);
     }
   }
 
   return ContentService.createTextOutput("ok");
 }
 
+function handleSlashCommand_(params) {
+  const text = String(params.text || "").trim();
+  const userName = String(params.user_name || params.user_id || "슬랙사용자").trim();
+  const parsed = parseSlashCommandText_(text);
+
+  if (!parsed.ok) {
+    return jsonResponse_({
+      response_type: "ephemeral",
+      text: buildSlashHelpText_(`명령어 해석 실패: ${parsed.error}`)
+    });
+  }
+
+  try {
+    if (parsed.type === "pending") {
+      return handleListCommandHybrid_("pending", parsed.period, userName, String(params.response_url || "").trim());
+    }
+
+    if (parsed.type === "completed") {
+      return handleListCommandHybrid_("completed", parsed.period, userName, String(params.response_url || "").trim());
+    }
+
+    if (parsed.type === "cancelled") {
+      return handleListCommandHybrid_("cancelled", parsed.period, userName, String(params.response_url || "").trim());
+    }
+
+    if (parsed.type === "clear_queue") {
+      clearSlackActionQueue();
+      return jsonResponse_({ response_type: "ephemeral", text: "액션 큐를 비웠습니다." });
+    }
+
+    return jsonResponse_({
+      response_type: "ephemeral",
+      text: buildSlashHelpText_("지원하지 않는 명령입니다.")
+    });
+  } catch (err) {
+    Logger.log(`[SlashCommand Failed] text=${text}, error=${err}`);
+    return jsonResponse_({
+      response_type: "ephemeral",
+      text: `명령 처리 중 오류가 발생했습니다: ${err}`
+    });
+  }
+}
+
+function handleListCommandHybrid_(mode, period, userName, responseUrl) {
+  const count = getReminderCandidateCount_(mode, period);
+  const modeLabel = mode === "pending" ? "예정" : (mode === "completed" ? "완료" : "취소");
+  const inlineThreshold = 5;
+
+  if (count <= inlineThreshold) {
+    const result = sendDailyReminders(mode, { period: period });
+    return jsonResponse_({
+      response_type: "ephemeral",
+      text: `${modeLabel} 스레드 발송 완료 (대상 ${count}건 / 성공 ${Number(result.sentCount || 0)}건, 실패 ${Number(result.failedCount || 0)}건)`
+    });
+  }
+
+  enqueueSlashCommandJob_(mode, {
+        requestedBy: userName,
+        responseUrl: responseUrl,
+        period: period
+      });
+  return jsonResponse_({
+    response_type: "ephemeral",
+    text: `${modeLabel} 스레드 발송을 접수했습니다. (대상 ${count}건) 완료 후 결과를 안내합니다.`
+  });
+}
+
+function parseSlashCommandText_(text) {
+  const raw = String(text || "").trim();
+  if (!raw || raw === "help" || raw === "도움말") {
+    return { ok: false, error: "help" };
+  }
+
+  const parts = raw.split(/\s+/).filter(v => !!v);
+  const command = String(parts[0] || "").toLowerCase();
+  const periodRaw = parts.length > 1 ? parts.slice(1).join(" ") : "";
+  const period = parsePeriodToken_(periodRaw);
+  if (!period.ok) return { ok: false, error: period.error };
+
+  if (["예정", "pending", "p"].indexOf(command) >= 0) {
+    return { ok: true, type: "pending", period: period.value };
+  }
+  if (["완료", "completed", "c"].indexOf(command) >= 0) {
+    return { ok: true, type: "completed", period: period.value };
+  }
+  if (["취소", "cancelled", "cancel", "x"].indexOf(command) >= 0) {
+    return { ok: true, type: "cancelled", period: period.value };
+  }
+  if (["큐비우기", "clear-queue", "clear_queue"].indexOf(command) >= 0) {
+    return { ok: true, type: "clear_queue" };
+  }
+
+  return { ok: false, error: "지원하지 않는 형식입니다." };
+}
+
+function buildSlashHelpText_(prefix) {
+  const help = [
+    prefix || "명령어를 입력하세요.",
+    "",
+    "[사용 예시]",
+    "- 예정",
+    "- 완료",
+    "- 취소",
+    "- 완료 최근7일",
+    "- 취소 최근30일",
+    "- 예정 전체",
+    "- 완료 2026-04-01~2026-04-30",
+    "- 큐비우기"
+  ];
+  return help.join("\n");
+}
+
+function jsonResponse_(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function enqueueSlashCommandJob_(type, payload) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const queue = getSlashCommandQueue_();
+    queue.push({
+      id: Utilities.getUuid(),
+      type: String(type || "").trim(),
+      payload: payload || {},
+      enqueuedAt: new Date().toISOString()
+    });
+    saveSlashCommandQueue_(queue);
+  } finally {
+    lock.releaseLock();
+  }
+  scheduleSlashCommandWorkerSoon_();
+}
+
+function processSlashCommandQueue() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  let batch = [];
+  try {
+    const queue = getSlashCommandQueue_();
+    if (!queue.length) return;
+    batch = queue.slice(0, 5);
+    saveSlashCommandQueue_(queue.slice(5));
+  } finally {
+    lock.releaseLock();
+  }
+
+  batch.forEach(job => {
+    try {
+      if (job.type === "pending" || job.type === "completed" || job.type === "cancelled") {
+        const mode = job.type;
+        const p = job.payload || {};
+        const result = sendDailyReminders(mode, { period: p.period || { type: "default" } });
+        notifySlashJobResult_(job, result);
+      }
+      else if (job.type === "status") {
+        const p = job.payload || {};
+        changeStatusByApprovalNo(p.approvalNo, p.targetStatus, p.actorName || p.requestedBy || "수동처리");
+      }
+    } catch (e) {
+      Logger.log(`[SlashJob Failed] type=${job.type}, error=${e}`);
+      notifySlashJobFailure_(job, e);
+    }
+  });
+}
+
+function processSlashCommandQueueOnce() {
+  processSlashCommandQueue();
+  cleanupSlashCommandTriggers_();
+}
+
+function scheduleSlashCommandWorkerSoon_() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const exists = ScriptApp.getProjectTriggers()
+      .some(t => t.getHandlerFunction() === "processSlashCommandQueueOnce");
+    if (exists) return;
+    ScriptApp.newTrigger("processSlashCommandQueueOnce")
+      .timeBased()
+      .after(1000)
+      .create();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function cleanupSlashCommandTriggers_() {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === "processSlashCommandQueueOnce") {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+}
+
+function getSlashCommandQueue_() {
+  const raw = SCRIPT_PROPS.getProperty("SLASH_COMMAND_QUEUE") || "[]";
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveSlashCommandQueue_(queue) {
+  SCRIPT_PROPS.setProperty("SLASH_COMMAND_QUEUE", JSON.stringify(queue || []));
+}
+
+function notifySlashJobResult_(job, result) {
+  const payload = job && job.payload ? job.payload : {};
+  const responseUrl = String(payload.responseUrl || "").trim();
+  if (!responseUrl) return;
+
+  const modeLabel = result && result.mode === "completed" ? "완료" : (result && result.mode === "cancelled" ? "취소" : "예정");
+  const lines = [
+    `${modeLabel} 스레드 발송 결과`,
+    `- 대상건수: ${Number(result && result.candidateCount || 0)}건`,
+    `- 성공: ${Number(result && result.sentCount || 0)}건`,
+    `- 실패: ${Number(result && result.failedCount || 0)}건`,
+    `- 상태: ${String(result && result.reason || "unknown")}`
+  ];
+  if (result && result.quotaHit) lines.push(`- 비고: 상한/쿼터 도달로 일부 중단`);
+
+  postToResponseUrl_(responseUrl, lines.join("\n"));
+}
+
+function notifySlashJobFailure_(job, error) {
+  const payload = job && job.payload ? job.payload : {};
+  const responseUrl = String(payload.responseUrl || "").trim();
+  if (!responseUrl) return;
+  postToResponseUrl_(responseUrl, `작업 실행 중 오류가 발생했습니다: ${String(error || "")}`);
+}
+
+function postToResponseUrl_(responseUrl, text) {
+  try {
+    UrlFetchApp.fetch(responseUrl, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify({
+        response_type: "ephemeral",
+        text: String(text || "")
+      }),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    Logger.log(`[ResponseUrl Notify Failed] ${e}`);
+  }
+}
+
+function parsePeriodToken_(rawPeriod) {
+  const token = String(rawPeriod || "").trim();
+  if (!token) return { ok: true, value: { type: "default" } };
+  const normalized = token.toLowerCase();
+  if (normalized === "전체" || normalized === "all") return { ok: true, value: { type: "all" } };
+  if (normalized === "최근7일" || normalized === "7d") return { ok: true, value: { type: "last_days", days: 7 } };
+  if (normalized === "최근30일" || normalized === "최근한달" || normalized === "30d") return { ok: true, value: { type: "last_days", days: 30 } };
+
+  const rangeMatch = token.match(/^(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})$/);
+  if (rangeMatch) {
+    const from = new Date(rangeMatch[1]);
+    const to = new Date(rangeMatch[2]);
+    if (isNaN(from.getTime()) || isNaN(to.getTime())) return { ok: false, error: "기간 형식이 잘못되었습니다." };
+    from.setHours(0, 0, 0, 0);
+    to.setHours(0, 0, 0, 0);
+    if (from > to) return { ok: false, error: "기간 시작일이 종료일보다 늦습니다." };
+    return { ok: true, value: { type: "range", from: from.getTime(), to: to.getTime() } };
+  }
+
+  return { ok: false, error: "기간은 전체/최근7일/최근30일/YYYY-MM-DD~YYYY-MM-DD 형식으로 입력하세요." };
+}
+
+function getReferenceDateForMode_(row, mode, dueDate) {
+  if (mode === "completed" && row[12]) {
+    const d = new Date(row[12]);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  if (mode === "cancelled" && row[18]) {
+    const d = new Date(row[18]);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+  const base = new Date(dueDate);
+  base.setHours(0, 0, 0, 0);
+  return base;
+}
+
+function shouldIncludeByPeriod_(mode, diffDays, referenceDate, period, targetDays, today) {
+  const p = period || { type: "default" };
+  if (p.type === "default") {
+    // 기본값 미입력 시 모든 모드 전체 조회
+    return true;
+  }
+  if (p.type === "all") return true;
+  if (p.type === "last_days") {
+    const days = Number(p.days || 0);
+    if (days <= 0) return false;
+    if (mode === "pending") return diffDays >= 0 && diffDays <= days;
+    const start = new Date(today);
+    start.setDate(start.getDate() - days);
+    return referenceDate >= start && referenceDate <= today;
+  }
+  if (p.type === "range") {
+    const from = Number(p.from || 0);
+    const to = Number(p.to || 0);
+    if (!from || !to) return false;
+    const t = referenceDate.getTime();
+    return t >= from && t <= to;
+  }
+  return false;
+}
+
+function getReminderCandidateCount_(mode, period) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('원장DB');
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 10) return 0;
+  const data = sheet.getRange(1, 1, lastRow, 19).getValues();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const targetDays = [10, 7, 5, 3, 1];
+  let count = 0;
+
+  for (let i = 9; i < data.length; i++) {
+    const row = data[i];
+    const status = String(row[11] || "").trim();
+    if (mode === "pending") {
+      if (['완료', '보류', '취소'].indexOf(status) >= 0) continue;
+    } else if (mode === "completed") {
+      if (status !== "완료") continue;
+    } else if (mode === "cancelled") {
+      if (status !== "취소") continue;
+    } else continue;
+
+    const dueDateRaw = row[6];
+    if (!dueDateRaw) continue;
+    const dueDate = new Date(dueDateRaw);
+    dueDate.setHours(0, 0, 0, 0);
+    const diffDays = Math.round((dueDate - today) / (1000 * 60 * 60 * 24));
+    const referenceDate = getReferenceDateForMode_(row, mode, dueDate);
+    if (shouldIncludeByPeriod_(mode, diffDays, referenceDate, period, targetDays, today)) count += 1;
+  }
+
+  return count;
+}
+
 /**
  * 4. 상태 업데이트 로직
  */
-function handleStatusUpdate(ts, targetStatus, slackUserId, clickedUserName, displayIndex, maxApiAttempts, fastMode) {
+function handleStatusUpdate(ts, targetStatus, slackUserId, clickedUserName, displayIndex, maxApiAttempts, fastMode, fallbackApprovalNo) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName('원장DB');
-  const data = sheet.getRange(1, 1, sheet.getLastRow(), 19).getValues();
-  const searchTs = String(ts).trim();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 10) return false;
 
+  const data = sheet.getRange(1, 1, lastRow, 19).getValues();
+  const searchTs = normalizeTs_(ts);
+  const approvalNo = String(fallbackApprovalNo || "").trim();
+  const userName = clickedUserName || getSlackUserName(slackUserId);
+  const now = new Date();
+
+  let targetRowIndex = -1;
   for (let i = 9; i < data.length; i++) {
-    if (String(data[i][16] || "").trim() === searchTs) {
-      const userName = clickedUserName || getSlackUserName(slackUserId);
-      const now = new Date();
-
-      if (targetStatus === "완료") {
-        sheet.getRange(i + 1, 12).setValue("완료");
-        sheet.getRange(i + 1, 13).setValue(now);
-        sheet.getRange(i + 1, 14).setValue(userName);
-      } else {
-        sheet.getRange(i + 1, 12).setValue(targetStatus);
-        sheet.getRange(i + 1, 18).setValue(userName); // R열: 변경자
-        sheet.getRange(i + 1, 19).setValue(now);      // S열: 변경일시
-        if (targetStatus === "예정" && String(data[i][11] || "").trim() === "완료") {
-          sheet.getRange(i + 1, 13).clearContent();   // M열: 집행일 초기화
-          sheet.getRange(i + 1, 14).clearContent();   // N열: 처리자 초기화
-        }
-      }
-
-      const updatedRow = sheet.getRange(i + 1, 1, 1, 19).getValues()[0];
-      const updatedBlocks = buildDetailBlocks(updatedRow, (targetStatus === "완료"), userName, displayIndex, targetStatus);
-      updateSlackMessageBlocks(ts, updatedBlocks, maxApiAttempts || 5, !!fastMode);
+    const rowTs = normalizeTs_(data[i][16]);
+    if (rowTs && rowTs === searchTs) {
+      targetRowIndex = i;
       break;
     }
   }
+
+  if (targetRowIndex < 0 && approvalNo) {
+    for (let i = 9; i < data.length; i++) {
+      if (String(data[i][2] || "").trim() === approvalNo) {
+        targetRowIndex = i;
+        break;
+      }
+    }
+  }
+
+  if (targetRowIndex < 0) return false;
+
+  const rowNum = targetRowIndex + 1;
+  const currentStatus = String(data[targetRowIndex][11] || "").trim();
+
+  if (targetStatus === "완료") {
+    sheet.getRange(rowNum, 12).setValue("완료");
+    sheet.getRange(rowNum, 13).setValue(now);
+    sheet.getRange(rowNum, 14).setValue(userName);
+  } else {
+    sheet.getRange(rowNum, 12).setValue(targetStatus);
+    sheet.getRange(rowNum, 18).setValue(userName);
+    sheet.getRange(rowNum, 19).setValue(now);
+    if (targetStatus === "예정" && currentStatus === "완료") {
+      sheet.getRange(rowNum, 13).clearContent();
+      sheet.getRange(rowNum, 14).clearContent();
+    }
+  }
+
+  const updatedRow = sheet.getRange(rowNum, 1, 1, 19).getValues()[0];
+  const normalizedIndex = displayIndex || deriveDisplayIndexFromRow_(targetRowIndex);
+  const updatedBlocks = buildDetailBlocks(updatedRow, (targetStatus === "완료"), userName, normalizedIndex, targetStatus);
+  updateSlackMessageBlocks(ts, updatedBlocks, maxApiAttempts || 2, !!fastMode);
+
+  // 드물게 발생하는 "다른 목록 스레드의 상태 미동기화" 보완
+  const approvalNoToSync = String(updatedRow[2] || "").trim();
+  if (approvalNoToSync) {
+    registerApprovalThreadTs_(approvalNoToSync, ts);
+    syncApprovalRelatedThreads_(approvalNoToSync, ts, updatedBlocks, maxApiAttempts || 2);
+  }
+  return true;
 }
 
 function enqueueSlackStatusAction(ts, targetStatus, slackUserId, clickedUserName, displayIndex) {
@@ -331,7 +918,10 @@ function postToSlackBlocks(blocks, threadTs = null) {
   const payload = { channel: SLACK_CHANNEL_ID, blocks: blocks };
   if (threadTs) payload.thread_ts = threadTs;
   const result = slackApiCall("https://slack.com/api/chat.postMessage", payload);
-  if (!result.ok) throw new Error(`Slack post 실패: ${result.error || 'unknown_error'}`);
+  if (!result.ok) {
+    if (result.error === "bandwidth_quota_exceeded_apps_script") return null;
+    throw new Error(`Slack post 실패: ${result.error || 'unknown_error'}`);
+  }
   return result.ts;
 }
 
@@ -356,8 +946,10 @@ function getSlackUserName(userId) {
   } catch (e) { return "조회실패"; }
 }
 
-function postToSlack(message) {
-  const result = slackApiCall("https://slack.com/api/chat.postMessage", { channel: SLACK_CHANNEL_ID, text: message });
+function postToSlack(message, threadTs) {
+  const payload = { channel: SLACK_CHANNEL_ID, text: message };
+  if (threadTs) payload.thread_ts = threadTs;
+  const result = slackApiCall("https://slack.com/api/chat.postMessage", payload);
   if (!result.ok) throw new Error(`Slack post 실패: ${result.error || 'unknown_error'}`);
   return result.ts;
 }
@@ -382,17 +974,26 @@ function buildParentSummaryLines(groups, mode, grandTotal) {
     Object.keys(descGroups).forEach(desc => {
       const rows = descGroups[desc];
       const total = rows.reduce((acc, item) => acc + Number(item.data[4] || 0), 0);
-      const isUrgent = mode === 'pending' && rows.some(item => Number(item.diffDays) <= 7);
-      const urgentPrefix = isUrgent ? '[🚨임박] ' : '';
-      lines.push(`${urgentPrefix}${date} | ${desc} | ${total.toLocaleString()}원 (총 ${rows.length}건)`);
+      const statusLabel = buildSummaryStatusLabel_(mode, rows);
+      lines.push(`- ${date} | ${statusLabel} | ${desc} | ${total.toLocaleString()}원 | 총 ${rows.length}건`);
     });
   });
 
   if (!lines.length) return "요약 데이터 없음";
 
   const separator = "--------------------------------";
-  const totalLabel = mode === 'pending' ? "[💰 지출 집행 예정 총계]" : "✅ [최근 완료 총계]";
+  const totalLabel = mode === 'pending' ? "[지출 집행 예정 총계]" : (mode === "completed" ? "✅ [최근 완료 총계]" : "⛔ [최근 취소 총계]");
   return `${lines.join('\n')}\n\n${separator}\n${totalLabel} : ${Number(grandTotal || 0).toLocaleString()}원`;
+}
+
+function buildSummaryStatusLabel_(mode, rows) {
+  if (mode === "completed") return "완료";
+  if (mode === "cancelled") return "취소";
+  if (!rows || !rows.length) return "➖ 상태없음";
+
+  const minDiff = rows.reduce((minVal, item) => Math.min(minVal, Number(item.diffDays || 99999)), 99999);
+  if (minDiff <= 7) return "임박";
+  return "여유";
 }
 
 function extractDisplayName(rawName) {
@@ -418,6 +1019,21 @@ function getDueInfo(dueDateRaw) {
   return { dateLabel: dateLabel, ddayLabel: ddayLabel };
 }
 
+function buildDetailFallbackText_(row, index, statusLabel) {
+  const amount = Number(row[4] || 0).toLocaleString();
+  const itemTitle = String(row[5] || '내역 없음').trim();
+  const target = String(row[7] || '-').trim();
+  const approvalNo = String(row[2] || '-').trim();
+  const dueInfo = getDueInfo(row[6]);
+  const prefix = index ? `${index}. ` : "";
+
+  if (statusLabel === "완료" || statusLabel === "취소") {
+    return `${prefix}\`${itemTitle}_${target}_${amount}원_${approvalNo}\`\n> ${statusLabel}`;
+  }
+
+  return `${prefix}*${itemTitle}* | *\`${approvalNo}\`*\n\`\`\`\n - 집행예정: ${dueInfo.dateLabel} | ${dueInfo.ddayLabel}\n - 집행대상: ${target}\n\`\`\``;
+}
+
 function slackApiCall(url, payload, maxAttempts, opts) {
   if (!SLACK_BOT_TOKEN) {
     throw new Error("SLACK_BOT_TOKEN이 설정되지 않았습니다. Script Properties에 등록하세요.");
@@ -429,13 +1045,25 @@ function slackApiCall(url, payload, maxAttempts, opts) {
   let waitMs = 1200;
 
   for (let i = 1; i <= attempts; i++) {
-    const response = UrlFetchApp.fetch(url, {
-      method: "post",
-      headers: { "Authorization": "Bearer " + SLACK_BOT_TOKEN },
-      contentType: "application/json",
-      muteHttpExceptions: true,
-      payload: JSON.stringify(payload)
-    });
+    let response;
+    try {
+      response = UrlFetchApp.fetch(url, {
+        method: "post",
+        headers: { "Authorization": "Bearer " + SLACK_BOT_TOKEN },
+        contentType: "application/json",
+        muteHttpExceptions: true,
+        payload: JSON.stringify(payload)
+      });
+    } catch (fetchErr) {
+      const msg = String(fetchErr || "");
+      if (msg.indexOf("Bandwidth quota exceeded") >= 0) {
+        return { ok: false, error: "bandwidth_quota_exceeded_apps_script" };
+      }
+      if (i === attempts) return { ok: false, error: `fetch_exception:${msg}` };
+      Utilities.sleep(waitMs);
+      waitMs = Math.min(waitMs * 2, 12000);
+      continue;
+    }
 
     const statusCode = response.getResponseCode();
     const bodyText = response.getContentText();
@@ -499,6 +1127,109 @@ function extractDisplayIndex(action, blocks) {
   return extractItemIndexFromBlocks(blocks);
 }
 
+function findRowByThreadTs_(sheet, threadTs) {
+  if (!sheet || !threadTs) return null;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 10) return null;
+
+  const normalizedTarget = normalizeTs_(threadTs);
+  const values = sheet.getRange(10, 17, lastRow - 9, 1).getValues(); // Q열(스레드 ts)
+  for (let i = 0; i < values.length; i++) {
+    const cellTs = normalizeTs_(values[i][0]);
+    if (cellTs && cellTs === normalizedTarget) {
+      return i + 10;
+    }
+  }
+  return null;
+}
+
+function findRowByApprovalNo_(sheet, approvalNo) {
+  const target = String(approvalNo || "").trim();
+  if (!sheet || !target) return null;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 10) return null;
+
+  const values = sheet.getRange(10, 3, lastRow - 9, 1).getValues(); // C열 결재번호
+  for (let i = 0; i < values.length; i++) {
+    if (String(values[i][0] || "").trim() === target) {
+      return i + 10;
+    }
+  }
+  return null;
+}
+
+function deriveDisplayIndexFromRow_(_rowIndex) {
+  // 신규 메시지는 버튼 value로 index를 유지하므로, 구형 메시지 fallback만 null 처리
+  return null;
+}
+
+function normalizeTs_(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.replace(/^'+/, "");
+}
+
+function extractApprovalNoFromBlocks_(blocks) {
+  try {
+    if (!blocks || !blocks.length) return "";
+    const first = blocks[0];
+    const text = first && first.text ? String(first.text.text || "") : "";
+
+    // 대기 포맷: "*1. 항목명* | *`PR2604...`*"
+    let match = text.match(/`([A-Za-z0-9_-]+)`/);
+    if (match && match[1]) return String(match[1]).trim();
+
+    // 완료/취소 포맷: "*`1 항목_대상_금액_PR2604...`*"
+    match = text.match(/_([A-Za-z0-9_-]+)`?\*/);
+    if (match && match[1]) return String(match[1]).trim();
+  } catch (e) {}
+  return "";
+}
+
+function registerApprovalThreadTs_(approvalNo, threadTs) {
+  const keyNo = String(approvalNo || "").trim();
+  const keyTs = normalizeTs_(threadTs);
+  if (!keyNo || !keyTs) return;
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(3000);
+  try {
+    const raw = SCRIPT_PROPS.getProperty("APPROVAL_THREAD_TS_MAP") || "{}";
+    let map = {};
+    try { map = JSON.parse(raw); } catch (e) { map = {}; }
+
+    const list = Array.isArray(map[keyNo]) ? map[keyNo] : [];
+    const merged = [keyTs].concat(list.filter(v => normalizeTs_(v) !== keyTs)).slice(0, 10);
+    map[keyNo] = merged;
+    SCRIPT_PROPS.setProperty("APPROVAL_THREAD_TS_MAP", JSON.stringify(map));
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getApprovalThreadTsList_(approvalNo) {
+  const keyNo = String(approvalNo || "").trim();
+  if (!keyNo) return [];
+  const raw = SCRIPT_PROPS.getProperty("APPROVAL_THREAD_TS_MAP") || "{}";
+  let map = {};
+  try { map = JSON.parse(raw); } catch (e) { map = {}; }
+  const list = Array.isArray(map[keyNo]) ? map[keyNo] : [];
+  return list.map(v => normalizeTs_(v)).filter(v => !!v);
+}
+
+function syncApprovalRelatedThreads_(approvalNo, currentTs, blocks, maxApiAttempts) {
+  const current = normalizeTs_(currentTs);
+  const list = getApprovalThreadTsList_(approvalNo).filter(ts => ts !== current);
+  list.forEach(ts => {
+    try {
+      updateSlackMessageBlocks(ts, blocks, maxApiAttempts || 2, true);
+      Utilities.sleep(80);
+    } catch (e) {
+      Logger.log(`[Sync Related Thread Failed] approvalNo=${approvalNo}, ts=${ts}, error=${e}`);
+    }
+  });
+}
+
 function getSlackActionQueue_() {
   const raw = SCRIPT_PROPS.getProperty("SLACK_ACTION_QUEUE") || "[]";
   try {
@@ -511,6 +1242,11 @@ function getSlackActionQueue_() {
 
 function saveSlackActionQueue_(queue) {
   SCRIPT_PROPS.setProperty("SLACK_ACTION_QUEUE", JSON.stringify(queue || []));
+}
+
+function clearSlackActionQueue() {
+  SCRIPT_PROPS.setProperty("SLACK_ACTION_QUEUE", "[]");
+  Logger.log("[Queue Cleared] SLACK_ACTION_QUEUE");
 }
 
 function trimSlackQueue_(queue, maxSize) {
@@ -535,16 +1271,19 @@ function scheduleSlackActionQueueWorkerSoon_() {
   lock.waitLock(5000);
   try {
     const now = Date.now();
-    const cooldownMs = 15000; // 단발 트리거 과생성 방지
+    const exists = ScriptApp.getProjectTriggers()
+      .some(t => t.getHandlerFunction() === "processSlackActionQueueOnce");
+    if (exists) return;
+
+    // 단발 트리거 과생성 방지(짧게 유지)
+    const cooldownMs = 3000;
     const lastScheduled = Number(SCRIPT_PROPS.getProperty("SLACK_QUEUE_ONESHOT_SCHEDULED_AT") || 0);
     if (lastScheduled && now - lastScheduled < cooldownMs) return;
 
-    const exists = ScriptApp.getProjectTriggers()
-      .some(t => t.getHandlerFunction() === "processSlackActionQueueOnce");
     if (!exists) {
       ScriptApp.newTrigger("processSlackActionQueueOnce")
         .timeBased()
-        .after(5000)
+        .after(1000)
         .create();
     }
     SCRIPT_PROPS.setProperty("SLACK_QUEUE_ONESHOT_SCHEDULED_AT", String(now));
@@ -666,6 +1405,43 @@ function buildQueueStatusText_(status) {
   return lines.join('\n');
 }
 
+function buildQuickStatusBlocksFromPayload_(payload, targetStatus, clickedUserName, displayIndex) {
+  const sectionText = ((payload || {}).message || {}).blocks && ((payload || {}).message || {}).blocks[0] && ((payload || {}).message || {}).blocks[0].text
+    ? String(((payload || {}).message || {}).blocks[0].text.text || "")
+    : "";
+  const titleLine = extractTitleLineFromSectionText_(sectionText);
+  const nowLabel = Utilities.formatDate(new Date(), "GMT+9", "yyyy-MM-dd HH:mm");
+  const name = extractDisplayName(clickedUserName || "시스템");
+  const statusLabel = targetStatus === "완료" ? "✅ 완료" : "⛔ 취소";
+
+  const mainText = `\n${titleLine}\n> ${statusLabel} | ${name} | ${nowLabel}`;
+  const buttonValue = String(displayIndex || "");
+
+  return [
+    { type: "section", text: { type: "mrkdwn", text: mainText } },
+    {
+      type: "actions",
+      elements: [
+        { type: "button", text: { type: "plain_text", text: "완료" }, style: "primary", action_id: "status_done", value: buttonValue },
+        { type: "button", text: { type: "plain_text", text: "취소" }, style: "danger", action_id: "status_cancel", value: buttonValue },
+        { type: "button", text: { type: "plain_text", text: "대기전환" }, action_id: "status_pending", value: buttonValue }
+      ]
+    }
+  ];
+}
+
+function extractTitleLineFromSectionText_(sectionText) {
+  const lines = String(sectionText || "").split("\n").map(v => String(v || "").trim()).filter(v => !!v);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.indexOf(">") === 0) continue;
+    if (line.indexOf("```") === 0) continue;
+    if (line.indexOf("- 집행") === 0) continue;
+    return line;
+  }
+  return "항목 정보";
+}
+
 /**
  * 매일 오전 9시(스크립트 타임존 기준) 큐 상태 자동 리포트
  * - 같은 날짜에 중복 실행되더라도 1회만 발송
@@ -695,6 +1471,7 @@ function dailyHealthCheck() {
 function setupOperationsTriggers() {
   setupSlackActionQueueTrigger();
   setupDailyHealthCheckTrigger();
+  setupDailyDigestTrigger();
 }
 
 function setupDailyHealthCheckTrigger() {
@@ -708,4 +1485,123 @@ function setupDailyHealthCheckTrigger() {
     .atHour(9)
     .nearMinute(0)
     .create();
+}
+
+/**
+ * 하루 1회 DM 요약 발송 잡
+ * - Script Properties의 DAILY_DM_USER_IDS(쉼표 구분 Slack User ID 목록) 대상으로 발송
+ * - 중복 발송 방지 키: DAILY_DIGEST_SENT_DATE
+ */
+function dailyDigestJob() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const todayKey = Utilities.formatDate(new Date(), "GMT+9", "yyyy-MM-dd");
+    const sentKey = SCRIPT_PROPS.getProperty("DAILY_DIGEST_SENT_DATE");
+    if (sentKey === todayKey) return;
+
+    const digestText = buildDailyDigestText_("pending");
+    const recipients = getDailyDigestRecipients_();
+    if (recipients.length) {
+      recipients.forEach(userId => {
+        try {
+          postToSlackDm_(userId, digestText);
+        } catch (e) {
+          Logger.log(`[DailyDigest Failed] user=${userId}, error=${e}`);
+        }
+      });
+    } else {
+      // DAILY_DM_USER_IDS 미설정 시 기본 채널로 자동 발송
+      postToSlack(digestText);
+    }
+
+    SCRIPT_PROPS.setProperty("DAILY_DIGEST_SENT_DATE", todayKey);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function setupDailyDigestTrigger() {
+  const handler = "dailyDigestJob";
+  const exists = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === handler);
+  if (exists) return;
+
+  ScriptApp.newTrigger(handler)
+    .timeBased()
+    .everyDays(1)
+    .atHour(9)
+    .nearMinute(5)
+    .create();
+}
+
+function buildDailyDigestText_(mode) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("원장DB");
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 10) return "*[지출 집행 예정 요약]*\n```요약 데이터 없음```";
+
+  const data = sheet.getRange(1, 1, lastRow, 19).getValues();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const targetDays = [10, 7, 5, 3, 1];
+
+  let grandTotal = 0;
+  const groups = {};
+
+  for (let i = 9; i < data.length; i++) {
+    const row = data[i];
+    const status = String(row[11] || "").trim();
+    if (mode === "pending") {
+      if (["완료", "보류", "취소"].includes(status)) continue;
+    } else if (status !== "완료") {
+      continue;
+    }
+
+    const dueDateRaw = row[6];
+    if (!dueDateRaw) continue;
+    const dueDate = new Date(dueDateRaw);
+    dueDate.setHours(0, 0, 0, 0);
+    const diffDays = Math.round((dueDate - today) / (1000 * 60 * 60 * 24));
+
+    if (mode === "completed" || targetDays.includes(diffDays)) {
+      const dayLabels = ["일", "월", "화", "수", "목", "금", "토"];
+      const dateStr = `${Utilities.formatDate(dueDate, "GMT+9", "yyyy-MM-dd")}(${dayLabels[dueDate.getDay()]})`;
+      const desc = String(row[5] || "내역 없음").trim();
+      if (!groups[dateStr]) groups[dateStr] = {};
+      if (!groups[dateStr][desc]) groups[dateStr][desc] = [];
+      groups[dateStr][desc].push({ data: row, diffDays: diffDays });
+      grandTotal += Number(row[4] || 0);
+    }
+  }
+
+  const lines = buildParentSummaryLines(
+    Object.keys(groups).reduce((acc, date) => {
+      acc[date] = { items: groups[date] };
+      return acc;
+    }, {}),
+    mode,
+    grandTotal
+  );
+
+  const title = mode === "pending" ? "*[지출 집행 예정 요약]*" : "*[최근 완료 내역]*";
+  return `${title}\n\`\`\`\n${lines}\n\`\`\`\n※ 상세내역은 아래 스래드를 확인하세요`;
+}
+
+function getDailyDigestRecipients_() {
+  const raw = SCRIPT_PROPS.getProperty("DAILY_DM_USER_IDS") || "";
+  return raw
+    .split(",")
+    .map(v => v.trim())
+    .filter(v => !!v);
+}
+
+function postToSlackDm_(userId, text) {
+  const openResult = slackApiCall("https://slack.com/api/conversations.open", { users: userId }, 3, { fastMode: true });
+  if (!openResult.ok || !openResult.channel || !openResult.channel.id) {
+    throw new Error(`DM 채널 오픈 실패: ${openResult.error || "unknown_error"}`);
+  }
+  const dmChannel = openResult.channel.id;
+  const result = slackApiCall("https://slack.com/api/chat.postMessage", { channel: dmChannel, text: text }, 3, { fastMode: true });
+  if (!result.ok) throw new Error(`DM 발송 실패: ${result.error || "unknown_error"}`);
+  return result.ts;
 }
