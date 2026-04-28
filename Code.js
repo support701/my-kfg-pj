@@ -1,6 +1,6 @@
 const SCRIPT_PROPS = PropertiesService.getScriptProperties();
 const SLACK_BOT_TOKEN = SCRIPT_PROPS.getProperty('SLACK_BOT_TOKEN') || '';
-const SLACK_CHANNEL_ID = SCRIPT_PROPS.getProperty('SLACK_CHANNEL_ID') || 'C0AV006BC3U';
+const SLACK_CHANNEL_ID = SCRIPT_PROPS.getProperty('SLACK_CHANNEL_ID') || 'C0B0MAD3QQZ';
 
 /**
  * 1. 지출 알림 전송 (Block Kit 적용)
@@ -317,56 +317,99 @@ function getActionButtonsForStatus_(status, index) {
  * 3. 슬랙 인터랙션 수신 (doPost)
  */
 function doPost(e) {
-  if (!e || !e.postData) return;
-  // Slash Command 처리 (application/x-www-form-urlencoded)
-  if (e.parameter && e.parameter.command) {
-    return handleSlashCommand_(e.parameter);
-  }
+  try {
+    if (!e || !e.postData) return ContentService.createTextOutput("");
 
-  const payload = e.parameter.payload ? JSON.parse(e.parameter.payload) : JSON.parse(e.postData.contents);
-  
-  // URL 검증용
-  if (payload.type === "url_verification") return ContentService.createTextOutput(payload.challenge);
+    // Slash Command 처리 (application/x-www-form-urlencoded)
+    if (e.parameter && e.parameter.command) {
+      return handleSlashCommand_(e.parameter);
+    }
 
-  // 버튼 클릭(block_actions) 처리
-  if (payload.type === "block_actions") {
-    const action = payload.actions[0];
-    const actionId = action.action_id;
-    const ts = payload.container.message_ts;
-    const userId = payload.user.id;
-    const clickedUserName = payload.user && payload.user.name ? payload.user.name : userId;
-    const displayIndex = extractDisplayIndex(action, payload.message && payload.message.blocks);
-    const fallbackApprovalNo = extractApprovalNoFromBlocks_(payload.message && payload.message.blocks);
+    const payload = parseSlackPayload_(e);
+    if (!payload) return ContentService.createTextOutput("");
+    
+    // URL 검증용
+    if (payload.type === "url_verification") return ContentService.createTextOutput(payload.challenge);
 
-    let targetStatus = "";
-    if (actionId === "status_done") targetStatus = "완료";
-    else if (actionId === "status_cancel") targetStatus = "취소";
-    else if (actionId === "status_pending") targetStatus = "예정";
+    // 버튼 클릭(block_actions) 처리
+    if (payload.type === "block_actions") {
+      const action = payload.actions && payload.actions.length ? payload.actions[0] : null;
+      if (!action) return ContentService.createTextOutput("");
 
-    if (targetStatus) {
-      // 롤백: 구조 분리 이전처럼 버튼 클릭 시 즉시 동기 처리
-      let handled = false;
-      try {
-        handled = handleStatusUpdate(ts, targetStatus, userId, clickedUserName, displayIndex, 2, true, fallbackApprovalNo);
-      } catch (e) {
-        Logger.log(`[doPost Immediate Failed] ts=${ts}, status=${targetStatus}, error=${e}`);
+      const actionId = action.action_id;
+      const ts = payload.container && payload.container.message_ts ? payload.container.message_ts : "";
+      const userId = payload.user && payload.user.id ? payload.user.id : "";
+      const clickedUserName = payload.user && payload.user.name ? payload.user.name : userId;
+      const displayIndex = extractDisplayIndex(action, payload.message && payload.message.blocks);
+      const fallbackApprovalNo = extractApprovalNoFromBlocks_(payload.message && payload.message.blocks);
+
+      let targetStatus = "";
+      if (actionId === "status_done") targetStatus = "완료";
+      else if (actionId === "status_cancel") targetStatus = "취소";
+      else if (actionId === "status_pending") targetStatus = "예정";
+
+      if (targetStatus && ts) {
+        // 롤백: 구조 분리 이전처럼 버튼 클릭 시 즉시 동기 처리
+        let handled = false;
+        try {
+          handled = handleStatusUpdate(ts, targetStatus, userId, clickedUserName, displayIndex, 2, true, fallbackApprovalNo);
+        } catch (innerErr) {
+          Logger.log(`[doPost Immediate Failed] ts=${ts}, status=${targetStatus}, error=${innerErr}`);
+        }
+        if (!handled) {
+          Logger.log(`[doPost NotHandled] ts=${ts}, status=${targetStatus}, approvalNo=${fallbackApprovalNo}`);
+        }
       }
-      if (!handled) {
-        Logger.log(`[doPost NotHandled] ts=${ts}, status=${targetStatus}, approvalNo=${fallbackApprovalNo}`);
+      return ContentService.createTextOutput("");
+    }
+    
+    // 기존 리액션 방식도 백업으로 유지
+    if (payload.event && payload.event.type === "reaction_added") {
+      const event = payload.event;
+      if (event.reaction === "white_check_mark") {
+        handleStatusUpdate(event.item.ts, "완료", event.user, event.user, null, 2, true);
       }
     }
+
+    return ContentService.createTextOutput("ok");
+  } catch (err) {
+    // Slack 인터랙션에서 비-200 응답을 방지하기 위해 빈 200 응답 반환
+    Logger.log(`[doPost Failed] ${err}`);
     return ContentService.createTextOutput("");
   }
-  
-  // 기존 리액션 방식도 백업으로 유지
-  if (payload.event && payload.event.type === "reaction_added") {
-    const event = payload.event;
-    if (event.reaction === "white_check_mark") {
-      handleStatusUpdate(event.item.ts, "완료", event.user, event.user, null, 2, true);
+}
+
+function parseSlackPayload_(e) {
+  const parameterPayload = e && e.parameter && e.parameter.payload ? String(e.parameter.payload) : "";
+  if (parameterPayload) {
+    try {
+      return JSON.parse(parameterPayload);
+    } catch (err) {
+      Logger.log(`[parseSlackPayload_] parameter payload parse failed: ${err}`);
     }
   }
 
-  return ContentService.createTextOutput("ok");
+  const body = e && e.postData && e.postData.contents ? String(e.postData.contents) : "";
+  if (!body) return null;
+
+  // Slack 인터랙션 표준 포맷: payload={url-encoded-json}
+  if (body.indexOf("payload=") === 0) {
+    const encoded = body.substring("payload=".length);
+    try {
+      return JSON.parse(decodeURIComponent(encoded.replace(/\+/g, "%20")));
+    } catch (err) {
+      Logger.log(`[parseSlackPayload_] urlencoded payload parse failed: ${err}`);
+      return null;
+    }
+  }
+
+  // JSON body 포맷 fallback
+  try {
+    return JSON.parse(body);
+  } catch (err) {
+    Logger.log(`[parseSlackPayload_] raw body parse failed: ${err}`);
+    return null;
+  }
 }
 
 function handleSlashCommand_(params) {
@@ -472,8 +515,9 @@ function buildSlashHelpText_(prefix) {
     "- 예정",
     "- 완료",
     "- 취소",
-    "- 완료 최근7일",
-    "- 취소 최근30일",
+    "- 예정 7",
+    "- 완료 30",
+    "- 취소 14",
     "- 예정 전체",
     "- 완료 2026-04-01~2026-04-30",
     "- init"
@@ -626,6 +670,19 @@ function parsePeriodToken_(rawPeriod) {
   if (!token) return { ok: true, value: { type: "default" } };
   const normalized = token.toLowerCase();
   if (normalized === "전체" || normalized === "all") return { ok: true, value: { type: "all" } };
+  // 숫자 단독 입력(예: 7, 30)은 최근 n일로 해석
+  if (/^\d{1,3}$/.test(normalized)) {
+    const days = Number(normalized);
+    if (days <= 0) return { ok: false, error: "일수는 1 이상의 숫자로 입력하세요." };
+    return { ok: true, value: { type: "last_days", days: days } };
+  }
+  // 숫자 + '일' 입력(예: 7일, 30일)도 지원
+  const dayMatch = normalized.match(/^(\d{1,3})일$/);
+  if (dayMatch) {
+    const days = Number(dayMatch[1]);
+    if (days <= 0) return { ok: false, error: "일수는 1 이상의 숫자로 입력하세요." };
+    return { ok: true, value: { type: "last_days", days: days } };
+  }
   if (normalized === "최근7일" || normalized === "7d") return { ok: true, value: { type: "last_days", days: 7 } };
   if (normalized === "최근30일" || normalized === "최근한달" || normalized === "30d") return { ok: true, value: { type: "last_days", days: 30 } };
 
@@ -640,7 +697,7 @@ function parsePeriodToken_(rawPeriod) {
     return { ok: true, value: { type: "range", from: from.getTime(), to: to.getTime() } };
   }
 
-  return { ok: false, error: "기간은 전체/최근7일/최근30일/YYYY-MM-DD~YYYY-MM-DD 형식으로 입력하세요." };
+  return { ok: false, error: "기간은 숫자(n일), 전체, YYYY-MM-DD~YYYY-MM-DD 형식으로 입력하세요." };
 }
 
 function getReferenceDateForMode_(row, mode, dueDate) {
