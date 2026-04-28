@@ -1445,22 +1445,12 @@ function extractTitleLineFromSectionText_(sectionText) {
 /**
  * 매일 오전 9시(스크립트 타임존 기준) 큐 상태 자동 리포트
  * - 같은 날짜에 중복 실행되더라도 1회만 발송
+ * - 현재 운영에서는 비활성화됨(슬랙 발송 없음)
  */
 function dailyHealthCheck() {
-  const lock = LockService.getScriptLock();
-  lock.waitLock(5000);
-  try {
-    const todayKey = Utilities.formatDate(new Date(), "GMT+9", "yyyy-MM-dd");
-    const sentKey = SCRIPT_PROPS.getProperty("DAILY_HEALTHCHECK_SENT_DATE");
-    if (sentKey === todayKey) return;
-
-    const status = inspectSlackActionQueueStatus(false);
-    const text = buildQueueStatusText_(status);
-    postToSlack(`*[일일 Queue 상태 리포트]*\n\`\`\`\n${text}\n\`\`\``);
-    SCRIPT_PROPS.setProperty("DAILY_HEALTHCHECK_SENT_DATE", todayKey);
-  } finally {
-    lock.releaseLock();
-  }
+  // 운영 정책 변경: 9시 자동 DM은 dailyDigestJob으로 통합하고,
+  // 큐 상태 리포트는 수동 점검 함수(inspectSlackActionQueueStatus)로만 사용.
+  return { ok: true, disabled: true };
 }
 
 /**
@@ -1470,7 +1460,7 @@ function dailyHealthCheck() {
  */
 function setupOperationsTriggers() {
   setupSlackActionQueueTrigger();
-  setupDailyHealthCheckTrigger();
+  removeDailyHealthCheckTrigger_();
   setupDailyDigestTrigger();
 }
 
@@ -1530,8 +1520,17 @@ function setupDailyDigestTrigger() {
     .timeBased()
     .everyDays(1)
     .atHour(9)
-    .nearMinute(5)
+    .nearMinute(0)
     .create();
+}
+
+function removeDailyHealthCheckTrigger_() {
+  const handler = "dailyHealthCheck";
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    if (trigger.getHandlerFunction() === handler) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
 }
 
 function buildDailyDigestText_(mode) {

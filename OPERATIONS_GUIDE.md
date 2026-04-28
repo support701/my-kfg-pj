@@ -10,6 +10,29 @@
   - 스레드 카드 생성 및 상태 버튼(`완료`, `취소`, `대기전환`)
   - 버튼 클릭 시 DB 상태 동기화 + 메시지 갱신
 
+## 1-1) 간단 운영 매뉴얼(실무용)
+
+- 매일 오전 9시(스크립트 타임존 기준)에 `dailyDigestJob()`이 자동 실행됩니다.
+- 자동 발송 내용은 `/cdv 예정` 성격의 "예정 요약"입니다.
+- `DAILY_DM_USER_IDS`가 설정되어 있으면 해당 사용자에게 DM으로 발송됩니다.
+- `DAILY_DM_USER_IDS`가 비어 있으면 `SLACK_CHANNEL_ID` 채널로 발송됩니다.
+- 큐 상태 리포트(`dailyHealthCheck`)는 현재 비활성화되어 자동 발송되지 않습니다.
+
+자주 쓰는 수동 명령:
+
+- `/cdv 예정` : 예정 요약/스레드 조회
+- `/cdv 완료` : 완료 건 조회
+- `/cdv 취소` : 취소 건 조회
+- `/cdv 예정 전체` : 기간 제한 없이 전체 조회
+- `/cdv 완료 최근7일` : 최근 7일 완료 건 조회
+- `/cdv init` : 액션 큐 초기화
+
+운영 점검(필요 시 Apps Script에서 수동 실행):
+
+- `inspectSlackActionQueueStatus(false)` : 로그로 큐 상태 확인
+- `inspectSlackActionQueueStatus(true)` : 채널로 큐 상태 전송
+- `nudgeSlackActionQueue()` : 지연 항목 즉시 처리 대상으로 당김
+
 ## 2) 현재 운영 안정화 상태
 
 현재 코드는 ACK-비동기 큐 구조로 전환되어, Slack 인터랙션 타임아웃(3초)을 구조적으로 완화합니다.
@@ -120,6 +143,35 @@
 3. Slack 명령 기반 DM(`전체/7일/30일/직접입력`) 구현
 4. 완료건 전용 DM 템플릿 분리
 5. 운영 대시보드 시트(최근 실패/큐 길이) 추가
+
+## 7-1) 새 시트 + 새 채널 이관 방법
+
+아래 순서대로 진행하면 안전하게 이관할 수 있습니다.
+
+1. 새 스프레드시트 준비
+   - 기존 원장 시트 구조를 동일하게 복사하고 시트 이름을 `원장DB`로 맞춥니다.
+   - 헤더/열 순서(C열 결재번호, L열 상태 등)는 기존과 동일해야 합니다.
+2. Apps Script 프로젝트 연결
+   - 새 시트에서 Apps Script를 열고 현재 `Code.js`를 그대로 반영합니다.
+   - 웹 앱 URL을 사용 중이라면 배포 버전을 최신으로 재배포합니다.
+3. Slack 앱/권한 점검
+   - Slash Command(`/cdv`)의 Request URL을 새 웹 앱 URL로 변경합니다.
+   - Bot Token에 `chat:write`, `commands` 등 기존 권한이 유지되는지 확인합니다.
+4. Script Properties 설정
+   - `SLACK_BOT_TOKEN`: 운영 Bot 토큰
+   - `SLACK_CHANNEL_ID`: 새 기본 채널 ID
+   - `DAILY_DM_USER_IDS`: DM 수신자(쉼표 구분, 선택)
+   - `MAX_THREAD_MESSAGES_PER_RUN`: 초기에는 `10` 권장
+5. 트리거 재설정
+   - `setupOperationsTriggers()`를 1회 실행해 트리거를 생성/정리합니다.
+   - 기대 상태:
+     - `processSlackActionQueue`: 1분 주기
+     - `dailyDigestJob`: 매일 오전 9시
+     - `dailyHealthCheck`: 없음(자동 비활성)
+6. 운영 검증(필수)
+   - `/cdv 예정` 수동 실행으로 메시지 발송/버튼 동작 확인
+   - 테스트 건 1개로 `완료/취소/대기전환` 상태 동기화 확인
+   - 다음날 오전 9시 자동 발송 여부 확인
 
 ## 8) 필수 설정 값
 
