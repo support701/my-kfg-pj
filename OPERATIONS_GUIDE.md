@@ -179,6 +179,26 @@
 - `SLACK_CHANNEL_ID` : 기본 발송 채널 ID
 - `DAILY_DM_USER_IDS` : (선택) 일일 DM 수신자 Slack User ID 목록(예: `U0123,U0456`)
   - 미설정 시 `SLACK_CHANNEL_ID` 채널로 자동 발송
+- `REQUESTER_SLACK_MAP` : (선택, fallback) 기안자명-슬랙ID 매핑 JSON
+  - 예: `{"홍길동":"U0123ABCD","김철수":"U0456EFGH"}`
+
+### 8-1) 기안자 개인 DM 매핑 방식(권장)
+
+상태 변경(완료/취소/대기전환) 시 기안자에게 DM 안내를 보내기 위해 아래 우선순위로 Slack ID를 찾습니다.
+
+1. 원장DB `V열`(슬랙ID) 값 사용 **(권장)**
+2. `REQUESTER_SLACK_MAP` Script Properties 값 사용(fallback)
+
+시트 컬럼 운영 권장:
+
+- `U열`: 기안자명
+- `V열`: 해당 기안자의 Slack User ID (`U...` 형식)
+
+예시:
+
+- `U열=홍길동`, `V열=U0123ABCD` → 상태 변경 시 `U0123ABCD`로 개인 DM 발송
+- `V열`이 비어 있으면 `REQUESTER_SLACK_MAP`에서 `홍길동` 키를 찾아 발송
+- 둘 다 없으면 DM은 스킵되고 로그에만 기록
 
 ## 9) 현재 안정 설정값(권장)
 

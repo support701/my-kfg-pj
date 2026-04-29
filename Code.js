@@ -38,7 +38,7 @@ function sendDailyReminders(mode = 'pending', opts) {
     return stats;
   }
 
-  const data = sheet.getRange(1, 1, lastRow, 19).getValues();
+  const data = sheet.getRange(1, 1, lastRow, 22).getValues();
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
@@ -243,6 +243,8 @@ function changeStatusByApprovalNo(approvalNo, targetStatus, actorName) {
       sheet.getRange(rowNum, 14).clearContent();
     }
   }
+  const updatedRow = sheet.getRange(rowNum, 1, 1, 22).getValues()[0];
+  notifyRequesterStatusChange_(updatedRow, status, displayName, currentStatus);
   return true;
 }
 
@@ -257,12 +259,12 @@ function buildDetailBlocks(row, isComplete, userName, index, currentStatus) {
   const target = String(row[7] || '-').trim();
   const approvalNo = String(row[2] || '-').trim();
   const memo = String(row[15] || '-').trim();
+  const requester = String(row[20] || '-').trim();
   const prefix = index ? `${index}. ` : "";
   const dueInfo = getDueInfo(row[6]);
   const amountRaw = Number(row[4] || 0);
   const amount = `${amountRaw.toLocaleString()}원`;
-  const titleLine = `${prefix}[*${itemTitle}*] \`${approvalNo}\``;
-  const detailCodeBlock = `\`\`\`\n - 집행예정: ${dueInfo.dateLabel} | ${dueInfo.ddayLabel}\n - 집행대상: ${target}\n - 계좌정보: ${bank} | ${account} | ${owner}\n - 담당메모: ${memo}\n\`\`\``;
+  const detailCodeBlock = `\`\`\`\n - 기안자명: ${requester}\n - 집행예정: ${dueInfo.dateLabel} | ${dueInfo.ddayLabel}\n - 집행대상: ${target}\n - 결제금액: ${amount}\n - 입금계좌: ${bank} | ${account} | ${owner}\n - 담당메모: ${memo}\n\`\`\``;
   
   let mainText = "";
   if (currentStatus === "완료") {
@@ -746,7 +748,7 @@ function getReminderCandidateCount_(mode, period) {
   const sheet = ss.getSheetByName('원장DB');
   const lastRow = sheet.getLastRow();
   if (lastRow < 10) return 0;
-  const data = sheet.getRange(1, 1, lastRow, 19).getValues();
+  const data = sheet.getRange(1, 1, lastRow, 22).getValues();
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const targetDays = [10, 7, 5, 3, 1];
@@ -784,7 +786,7 @@ function handleStatusUpdate(ts, targetStatus, slackUserId, clickedUserName, disp
   const lastRow = sheet.getLastRow();
   if (lastRow < 10) return false;
 
-  const data = sheet.getRange(1, 1, lastRow, 19).getValues();
+  const data = sheet.getRange(1, 1, lastRow, 22).getValues();
   const searchTs = normalizeTs_(ts);
   const approvalNo = String(fallbackApprovalNo || "").trim();
   const userName = clickedUserName || getSlackUserName(slackUserId);
@@ -827,7 +829,7 @@ function handleStatusUpdate(ts, targetStatus, slackUserId, clickedUserName, disp
     }
   }
 
-  const updatedRow = sheet.getRange(rowNum, 1, 1, 19).getValues()[0];
+  const updatedRow = sheet.getRange(rowNum, 1, 1, 22).getValues()[0];
   const normalizedIndex = displayIndex || deriveDisplayIndexFromRow_(targetRowIndex);
   const updatedBlocks = buildDetailBlocks(updatedRow, (targetStatus === "완료"), userName, normalizedIndex, targetStatus);
   updateSlackMessageBlocks(ts, updatedBlocks, maxApiAttempts || 2, !!fastMode);
@@ -838,6 +840,9 @@ function handleStatusUpdate(ts, targetStatus, slackUserId, clickedUserName, disp
     registerApprovalThreadTs_(approvalNoToSync, ts);
     syncApprovalRelatedThreads_(approvalNoToSync, ts, updatedBlocks, maxApiAttempts || 2);
   }
+
+  // 상태 변경 시 기안자에게 개인 DM 안내
+  notifyRequesterStatusChange_(updatedRow, targetStatus, userName, currentStatus);
   return true;
 }
 
@@ -1049,8 +1054,9 @@ function buildSummaryStatusLabel_(mode, rows) {
   if (!rows || !rows.length) return "➖ 상태없음";
 
   const minDiff = rows.reduce((minVal, item) => Math.min(minVal, Number(item.diffDays || 99999)), 99999);
-  if (minDiff <= 7) return "임박";
-  return "여유";
+  if (!isFinite(minDiff) || minDiff === 99999) return "D-?";
+  if (minDiff >= 0) return `D-${minDiff}`;
+  return `D+${Math.abs(minDiff)}`;
 }
 
 function extractDisplayName(rawName) {
@@ -1082,13 +1088,108 @@ function buildDetailFallbackText_(row, index, statusLabel) {
   const target = String(row[7] || '-').trim();
   const approvalNo = String(row[2] || '-').trim();
   const dueInfo = getDueInfo(row[6]);
+  const requester = String(row[20] || '-').trim();
+  const bank = String(row[8] || '').trim();
+  const account = String(row[9] || '').trim();
+  const owner = String(row[10] || '').trim();
+  const memo = String(row[15] || '-').trim();
   const prefix = index ? `${index}. ` : "";
 
   if (statusLabel === "완료" || statusLabel === "취소") {
     return `${prefix}\`${itemTitle}_${target}_${amount}원_${approvalNo}\`\n> ${statusLabel}`;
   }
 
-  return `${prefix}*${itemTitle}* | *\`${approvalNo}\`*\n\`\`\`\n - 집행예정: ${dueInfo.dateLabel} | ${dueInfo.ddayLabel}\n - 집행대상: ${target}\n\`\`\``;
+  return `${prefix}*${itemTitle}* | *\`${approvalNo}\`*\n\`\`\`\n - 기안자명: ${requester}\n - 집행예정: ${dueInfo.dateLabel} | ${dueInfo.ddayLabel}\n - 집행대상: ${target}\n - 결제금액: ${amount}원\n - 입금계좌: ${bank} | ${account} | ${owner}\n - 담당메모: ${memo}\n\`\`\``;
+}
+
+function notifyRequesterStatusChange_(row, targetStatus, actorName, previousStatus) {
+  try {
+    const statusLabel = String(targetStatus || "").trim();
+    const prevStatus = String(previousStatus || "").trim();
+    // 최초 상태 대비 실변경이 있을 때만 DM 발송
+    if (!statusLabel || prevStatus === statusLabel) return false;
+
+    const requesterName = String(row[20] || "").trim();
+    if (!requesterName) return false;
+
+    // 1순위: 원장DB V열(슬랙 ID), 2순위: Script Properties 매핑
+    const rowSlackUserId = sanitizeSlackUserId_(row[21]);
+    const requesterUserId = rowSlackUserId || getRequesterSlackUserId_(requesterName);
+    if (!requesterUserId) {
+      Logger.log(`[Requester DM Skip] 매핑 없음: requester=${requesterName}, vCol=${String(row[21] || "").trim()}`);
+      return false;
+    }
+
+    const itemTitle = String(row[5] || "내역 없음").trim();
+    const target = String(row[7] || "-").trim();
+    const approvalNo = String(row[2] || "-").trim();
+    const amount = `${Number(row[4] || 0).toLocaleString()}원`;
+    const dueInfo = getDueInfo(row[6]);
+    const bank = String(row[8] || "").trim();
+    const account = String(row[9] || "").trim();
+    const owner = String(row[10] || "").trim();
+    const memo = String(row[15] || "-").trim();
+    const handler = extractDisplayName(actorName || "시스템");
+    const nowLabel = Utilities.formatDate(new Date(), "GMT+9", "yyyy-MM-dd HH:mm");
+
+    const dmText = [
+      `*[지출결의 상태 변경 안내]*`,
+      "",
+      "```",
+      "1. 처리정보",
+      ` - 처리상태: ${prevStatus || "-"} > ${statusLabel}`,
+      ` - 처리건명: ${itemTitle} | ${target}`,
+      ` - 처리자명: ${handler}`,
+      ` - 처리일시: ${nowLabel}`,
+      "-----------------------------------------",
+      "2. 결제정보",
+      ` - 결재번호: ${approvalNo}`,
+      ` - 결제금액: ${amount}`,
+      ` - 입금정보: ${bank} | ${account} | ${owner}`,
+      ` - 담당메모: ${memo}`,
+      "```"
+    ].join("\n");
+
+    postToSlackDm_(requesterUserId, dmText);
+    Logger.log(`[Requester DM Sent] requester=${requesterName}, userId=${requesterUserId}, status=${prevStatus}->${statusLabel}`);
+    return true;
+  } catch (err) {
+    Logger.log(`[Requester DM Failed] error=${err}`);
+    return false;
+  }
+}
+
+function getRequesterSlackUserId_(requesterName) {
+  const normalized = normalizeRequesterKey_(requesterName);
+  if (!normalized) return "";
+
+  // 예: {"홍길동":"U0123ABCD","김코덱":"U0456EFGH"}
+  const raw = SCRIPT_PROPS.getProperty("REQUESTER_SLACK_MAP") || "{}";
+  let map = {};
+  try {
+    map = JSON.parse(raw);
+  } catch (e) {
+    Logger.log(`[REQUESTER_SLACK_MAP Parse Failed] ${e}`);
+    return "";
+  }
+
+  const direct = String(map[requesterName] || "").trim();
+  if (direct) return direct;
+
+  const keyMatched = Object.keys(map).find(name => normalizeRequesterKey_(name) === normalized);
+  return keyMatched ? String(map[keyMatched] || "").trim() : "";
+}
+
+function normalizeRequesterKey_(name) {
+  return String(name || "").trim().replace(/\s+/g, "").toLowerCase();
+}
+
+function sanitizeSlackUserId_(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const normalized = raw.replace(/[<@>]/g, "").toUpperCase();
+  // Slack 사용자 ID는 보통 U... 또는 W... 형식을 사용
+  return /^[UW][A-Z0-9]+$/.test(normalized) ? normalized : "";
 }
 
 function slackApiCall(url, payload, maxAttempts, opts) {
@@ -1547,7 +1648,9 @@ function dailyDigestJob() {
     const sentKey = SCRIPT_PROPS.getProperty("DAILY_DIGEST_SENT_DATE");
     if (sentKey === todayKey) return;
 
-    const digestText = buildDailyDigestText_("pending");
+    // /cdv 예정과 동일 로직으로 최신 데이터 기반 parent+thread 자동 발송
+    const runResult = sendDailyReminders("pending", { period: { type: "default" } });
+    const digestText = buildDailyDigestTextFromRunResult_(runResult);
     const recipients = getDailyDigestRecipients_();
     if (recipients.length) {
       recipients.forEach(userId => {
@@ -1596,7 +1699,7 @@ function buildDailyDigestText_(mode) {
   const lastRow = sheet.getLastRow();
   if (lastRow < 10) return "*[지출 집행 예정 요약]*\n```요약 데이터 없음```";
 
-  const data = sheet.getRange(1, 1, lastRow, 19).getValues();
+  const data = sheet.getRange(1, 1, lastRow, 22).getValues();
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const targetDays = [10, 7, 5, 3, 1];
@@ -1641,6 +1744,29 @@ function buildDailyDigestText_(mode) {
 
   const title = mode === "pending" ? "*[지출 집행 예정 요약]*" : "*[최근 완료 내역]*";
   return `${title}\n\`\`\`\n${lines}\n\`\`\`\n※ 상세내역은 아래 스래드를 확인하세요`;
+}
+
+function buildDailyDigestTextFromRunResult_(result) {
+  const modeLabel = result && result.mode === "completed" ? "완료" : (result && result.mode === "cancelled" ? "취소" : "예정");
+  const candidateCount = Number(result && result.candidateCount || 0);
+  const sentCount = Number(result && result.sentCount || 0);
+  const failedCount = Number(result && result.failedCount || 0);
+  const reason = String(result && result.reason || "unknown");
+
+  if (candidateCount === 0) {
+    return `*[일일 ${modeLabel} 요약]*\n\`\`\`\n오늘 기준 ${modeLabel} 대상 건이 없습니다.\n\`\`\``;
+  }
+
+  const lines = [
+    `[일일 ${modeLabel} 자동 발송 완료]`,
+    `- 대상건수: ${candidateCount}건`,
+    `- 스레드 발송: ${sentCount}건`,
+    `- 실패: ${failedCount}건`,
+    `- 상태: ${reason}`,
+    "",
+    "상세 내역은 채널 스레드에서 확인해 주세요."
+  ];
+  return lines.join("\n");
 }
 
 function getDailyDigestRecipients_() {
